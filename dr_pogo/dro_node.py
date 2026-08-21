@@ -18,6 +18,9 @@ import cv2
 import time
 
 class DroNode(Node):
+    # Maximum time to wait for trailing IMU data after the end of a radar scan
+    MAX_TRAILING_IMU_WAIT_SEC = 0.5
+
     def __init__(self):
         super().__init__('dro_node')
         self.get_logger().info("DroNode has been started.")
@@ -34,6 +37,9 @@ class DroNode(Node):
         self.radar_info_subscription = Subscriber(self, RadarInfo, '/boreas/radar_info')
         self.ts = TimeSynchronizer([self.image_subscription, self.radar_info_subscription], 20)
         self.ts.registerCallback(self.radarCallback)
+
+        # Re-check periodically so a buffered scan isn't stuck waiting forever once messages stop arriving
+        self.create_timer(0.1, self.odometryStepIfReady)
 
         # Set the publisher for the odometry
         self.odometry_publisher = self.create_publisher(Odometry, 'dro_odometry', 10)
@@ -54,6 +60,7 @@ class DroNode(Node):
 
         self.initialized = False
         self.first = True
+        self.pending_radar_wait_start = None
 
         # Load the config file and populate the DRO options
         config_file_path = "config/config_dro.yaml"
@@ -141,6 +148,7 @@ class DroNode(Node):
     def radarCallback(self, image_msg, radar_info_msg):
         if self.initialized == False:
             self.initialize({'sequence_id': radar_info_msg.sequence_id})
+
         polar_image = np.frombuffer(image_msg.data, dtype=np.float32).reshape((image_msg.height, image_msg.width))
         azimuths = np.asarray(radar_info_msg.azimuth, dtype=np.float32)
         timestamps = np.asarray(radar_info_msg.timestamps, dtype=np.int64)
@@ -187,9 +195,27 @@ class DroNode(Node):
             self.first = False
 
         last_radar_time = self.radar_data_buffer[0]['timestamps'][-1] + 2000  # Add 2ms to ensure we cover the radar timestamps
-        if self.imu_data_buffer[0]['timestamp'] > first_radar_time or self.imu_data_buffer[-1]['timestamp'] < last_radar_time:
+
+        # TODO: Support case where IMU arrives after scan starts
+        if self.imu_data_buffer[0]['timestamp'] > first_radar_time:
+            self.pending_radar_wait_start = None
             return
-        
+
+        # Wait for IMU to arrive or for the wait timeout to expire before processing the radar scan
+        if self.imu_data_buffer[-1]['timestamp'] < last_radar_time:
+            now = time.time()
+            if self.pending_radar_wait_start is None:
+                self.pending_radar_wait_start = now
+                return
+            if now - self.pending_radar_wait_start < self.MAX_TRAILING_IMU_WAIT_SEC:
+                return
+            self.get_logger().warn(
+                f"Trailing IMU for radar scan at {first_radar_time} did not arrive within "
+                f"{self.MAX_TRAILING_IMU_WAIT_SEC}s; processing with the IMU available so far."
+            )
+
+        self.pending_radar_wait_start = None
+
         # Get the minimum number of IMU measurements that cover the radar timestamps
         imu_times = np.array([imu['timestamp'] for imu in self.imu_data_buffer])
         start_idx = np.searchsorted(imu_times, first_radar_time, side='left')
