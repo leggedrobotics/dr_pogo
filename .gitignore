@@ -1,2 +1,6 @@
 *__pycache__*
 *venv*
+
+# Project-specific
+config_dro.yaml
+output
