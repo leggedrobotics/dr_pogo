@@ -1,15 +1,19 @@
+import os
+
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from launch.substitutions import PathJoinSubstitution
 
+# Repo root (src/dr_pogo), resolved via this file's real path so it works
+# with --symlink-install without hardcoding a machine-specific path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
 
 def generate_launch_description() -> LaunchDescription:
 	rviz_file = PathJoinSubstitution(
            [FindPackageShare("dr_pogo"), "config", "rviz.rviz"])
-	output_path = PathJoinSubstitution(
-		[FindPackageShare("dr_pogo"), "output"]
-	)
+	output_path = os.path.join(_REPO_ROOT, "output")
 	return LaunchDescription(
 		[
 			Node(
