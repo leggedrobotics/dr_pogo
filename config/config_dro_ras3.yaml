@@ -31,11 +31,14 @@ radar:
   # The physical value is +0.944 (Burnett et al. 2024 correction factor) and it
   # DIVERGES here. The RAS-3 is a down-chirp radar: dro_node sets the chirp
   # flag (chirp_down: true), which negates the shift in dro.py:844, so the value
-  # below is the calibrated MAGNITUDE. It is ~2.4x the physical one; the excess
-  # is empirical (swept against DLIO on hg_4/hg_nav_*/bedsheet_*; -0.80 from
-  # upstream's non-Doppler config diverges on hg_nav_5) and unexplained as of
-  # 2026-09-07. Equivalent offline setting: beta_corr_fact -2.249 with chirps 0.
-  beta_corr_fact: 2.249
+  # below is the calibrated MAGNITUDE. It is ~3.2x the physical one; the excess
+  # is empirical and unexplained as of 2026-09-07. Swept on 8 bags (hg_4,
+  # hg_nav_2/4/5/8, bedsheet_5/7/9) against DLIO: 3.0 is best or tied-best on
+  # every bag that discriminates (hg_4 ATE 0.935 vs 1.23 at 2.249; bedsheet_7
+  # 0.100 vs 0.203) and within 1-3% on the rest. Upstream's non-Doppler 0.80
+  # diverges on hg_4, hg_nav_5 and bedsheet_7. Equivalent offline setting:
+  # beta_corr_fact -3.0 with chirps 0.
+  beta_corr_fact: 3.0
 
 gp:
   lengthscale_az: 2.0
