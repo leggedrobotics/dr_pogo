@@ -1,0 +1,39 @@
+# DRO (dr_pogo, leggedrobotics ras3 branch) as an online ROS 2 Jazzy node on
+# NVIDIA Jetson Thor (pc7). Sister service to CFEAR in FogNav-radar-splatting.
+#
+# Build from the repository root (the compose `dro` service does this):
+#   docker build -f docker/Dockerfile.jetson -t rslethz/fognav:dro .
+#
+# Base: jetfast:thor-dev is built locally on pc7 (no registry) and already
+# carries ROS 2 Jazzy, PyTorch 2.12+cu130 for sm_110, torchvision, OpenCV,
+# cv_bridge, message_filters, Ceres, yaml-cpp and CycloneDDS -- all inside the
+# same /opt/venv python, which is what makes `import torch` and `import rclpy`
+# coexist. Do not swap it for an l4t-pytorch image without re-checking that.
+FROM jetfast:thor-dev
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# dro.py imports sklearn at module level (pairwise_distances); scikit-image is
+# only needed by raplace_node. pc7's pip defaults to a local devpi mirror that
+# does not carry scikit-learn, hence the explicit index.
+RUN /opt/venv/bin/python3 -m pip install --no-cache-dir \
+        --index-url https://pypi.org/simple scikit-learn scikit-image
+
+# Same RMW and tuned config as the robot side / CFEAR (bigger receive buffers
+# for whole-rotation radar frames).
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+COPY docker/cyclonedds.xml /ws/config/cyclonedds.xml
+ENV CYCLONEDDS_URI=file:///ws/config/cyclonedds.xml
+
+WORKDIR /ws
+COPY . src/dr_pogo
+RUN . /opt/ros/jazzy/setup.sh && \
+    colcon build --merge-install --packages-select dr_pogo \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+RUN echo 'source /opt/ros/jazzy/setup.bash' >> /root/.bashrc && \
+    echo 'source /ws/install/setup.bash' >> /root/.bashrc
+
+COPY docker/ros_entrypoint.sh /ros_entrypoint_dro.sh
+ENTRYPOINT ["/ros_entrypoint_dro.sh"]
+CMD ["bash"]
