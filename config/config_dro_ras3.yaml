@@ -1,0 +1,59 @@
+# DRO on the Navtech RAS-3 (leggedrobotics B2W). Companion to dro_node.py's
+# input_mode: radar_frame. See the DRO analysis README in the thesis
+# data_analysis repo (dro_vs_cfear/README.md) for the derivations.
+
+estimation:
+  use_gyro: true
+  estimate_gyro_bias: true
+  estimate_vy_bias: false
+  vy_bias_prior: 0.0
+  gyro_bias_alpha: 0.01
+  max_acceleration: 10.0
+
+radar:
+  resolution: 0.040307827
+  nb_azimuths: 400
+  range_offset: 0.0        # bin*bin_size already matches lidar to 3 cm; the
+                           # radar's own -0.32 m offset makes it worse
+  doppler_enabled: false   # sawtooth radar: no separate Doppler cost; the
+                           # range-Doppler distortion correction still applies
+  # Chirp parameters MEASURED off the radar on 2026-09-07 (RAS3-DEV, serial
+  # 129041) with navtech_chirp_params.py, not from a datasheet:
+  #   rangeresolutionhz 610.3516 at 0.040307827 m/bin
+  #   -> sweep slope S = c*rrHz/(2*res) = 2.269768e12 Hz/s
+  #   packet_rate 1600 confirms meas_freq (400 azimuths x 4 Hz)
+  #   range_gain 0.999691 (so S is not rescaled by the radar's range calibration)
+  # Only f_mid = ft + del_f/2 (assumed 76.5 GHz, 76-77 GHz band) and
+  # S = del_f*meas_freq matter; the split below is arbitrary.
+  ft: 75.7907E9
+  del_f: 1.418605E9
+  meas_freq: 1600.0
+  # The physical value is +0.944 (Burnett et al. 2024 correction factor) and it
+  # DIVERGES here. The RAS-3 is a down-chirp radar: dro_node sets the chirp
+  # flag (chirp_down: true), which negates the shift in dro.py:844, so the value
+  # below is the calibrated MAGNITUDE. It is ~2.4x the physical one; the excess
+  # is empirical (swept against DLIO on hg_4/hg_nav_*/bedsheet_*; -0.80 from
+  # upstream's non-Doppler config diverges on hg_nav_5) and unexplained as of
+  # 2026-09-07. Equivalent offline setting: beta_corr_fact -2.249 with chirps 0.
+  beta_corr_fact: 2.249
+
+gp:
+  lengthscale_az: 2.0
+  lengthscale_range: 4.0
+  sz: 0.6
+
+direct:
+  min_range: 4.0
+  max_range: 65.0
+  max_local_map_range: 120.0
+  local_map_res: 0.10      # the only real speed lever (0.20 misses the 250 ms
+                           # budget 1.2% of the time on an idle Thor)
+  local_map_update_alpha: 0.1
+
+doppler:
+  min_range: 4.0
+  max_range: 200.0
+
+log:
+  verbose: false
+  save_local_maps: false

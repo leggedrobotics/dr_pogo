@@ -25,18 +25,45 @@ class DroNode(Node):
         super().__init__('dro_node')
         self.get_logger().info("DroNode has been started.")
 
-        # Subscribe to the imu topic
-        self.imu_subscription = self.create_subscription(
-            Imu,
-            '/boreas/imu',
-            self.imuCallback,
-            1000)
-        
-        # Subscribe synchronously to the image topic and radar info topic
-        self.image_subscription = Subscriber(self, Image, '/boreas/radar_image')
-        self.radar_info_subscription = Subscriber(self, RadarInfo, '/boreas/radar_info')
-        self.ts = TimeSynchronizer([self.image_subscription, self.radar_info_subscription], 20)
-        self.ts.registerCallback(self.radarCallback)
+        # Inputs. 'boreas' keeps the upstream Image+RadarInfo pair; 'radar_frame'
+        # consumes the leggedrobotics polar-frame pipeline directly: a mono8 Image
+        # whose first `metadata_columns` bytes per row carry the Oxford/Boreas
+        # layout (uint64 LE unix time [us], uint16 LE encoder tick, valid flag).
+        self.declare_parameter('input_mode', 'radar_frame')
+        self.declare_parameter('imu_topic', '/imu')
+        self.declare_parameter('radar_frame_topic', '/radar_data/radar_frame')
+        self.declare_parameter('metadata_columns', 11)
+        self.declare_parameter('encoder_size', 16000)
+        # The RAS-3 turns clockwise. Ascending row order maps to a CCW frame in
+        # DRO, so bearings are taken as -tick/encoder_size*2pi to keep the output
+        # right-handed instead of mirrored.
+        self.declare_parameter('clockwise_radar', True)
+        # Down-chirp radar: DRO negates the range-Doppler shift when the chirp
+        # flag is non-zero (dro.py:844). Measured on the RAS-3, see
+        # config/config_dro_ras3.yaml.
+        self.declare_parameter('chirp_down', True)
+        self.declare_parameter('odom_frame_id', 'dro_odom')
+        self.declare_parameter('child_frame_id', 'radar_link')
+        self.declare_parameter('config_file', '')
+        gp = lambda k: self.get_parameter(k).value
+        self.input_mode = gp('input_mode')
+        self.metadata_columns = int(gp('metadata_columns'))
+        self.encoder_size = float(gp('encoder_size'))
+        self.clockwise_radar = bool(gp('clockwise_radar'))
+        self.chirp_down = bool(gp('chirp_down'))
+        self.odom_frame_id = gp('odom_frame_id')
+        self.child_frame_id = gp('child_frame_id')
+
+        self.imu_subscription = self.create_subscription(Imu, gp('imu_topic'), self.imuCallback, 1000)
+
+        if self.input_mode == 'boreas':
+            self.image_subscription = Subscriber(self, Image, '/boreas/radar_image')
+            self.radar_info_subscription = Subscriber(self, RadarInfo, '/boreas/radar_info')
+            self.ts = TimeSynchronizer([self.image_subscription, self.radar_info_subscription], 20)
+            self.ts.registerCallback(self.radarCallback)
+        else:
+            self.radar_frame_subscription = self.create_subscription(
+                Image, gp('radar_frame_topic'), self.radarFrameCallback, 10)
 
         # Re-check periodically so a buffered scan isn't stuck waiting forever once messages stop arriving
         self.create_timer(0.1, self.odometryStepIfReady)
@@ -63,9 +90,10 @@ class DroNode(Node):
         self.pending_radar_wait_start = None
 
         # Load the config file and populate the DRO options
-        config_file_path = "config/config_dro.yaml"
-        base_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        config_file_path = os.path.join(base_path, "share/dr_pogo", config_file_path)
+        config_file_path = gp('config_file')
+        if not config_file_path:
+            base_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            config_file_path = os.path.join(base_path, "share/dr_pogo", "config/config_dro.yaml")
         print(f"Loading DRO configuration from {config_file_path}")
         with open(config_file_path, 'r') as file:
             config = yaml.safe_load(file)
@@ -166,6 +194,41 @@ class DroNode(Node):
 
         self.odometryStepIfReady()
 
+    def radarFrameCallback(self, image_msg):
+        """leggedrobotics polar frame -> the dict odometryStep expects."""
+        if self.initialized == False:
+            self.initialize({'sequence_id': 'live'})
+        h, w = image_msg.height, image_msg.width
+        img = np.frombuffer(image_msg.data, dtype=np.uint8).reshape((h, image_msg.step))[:, :w]
+        m = self.metadata_columns
+        meta = img[:, :m]
+        ts = meta[:, :8].copy().view(np.uint64).ravel().astype(np.int64)
+        tick = meta[:, 8:10].copy().view(np.uint16).ravel().astype(np.float64)
+        o = np.argsort(ts)                              # row 0 holds the LAST spoke
+        az = tick[o] / self.encoder_size * 2.0 * np.pi
+        if self.clockwise_radar:
+            az = -az
+        self.radar_data_buffer.append({
+            'polar': img[o, m:].astype(np.float32) / 255.0,
+            'azimuths': az.astype(np.float32),
+            'timestamps': ts[o],
+            'resolution': self.dro_opts['radar']['resolution'],
+            'chirps': np.full(h, 1 if self.chirp_down else 0, np.uint8),
+            'timestamp': np.int64(image_msg.header.stamp.sec * 1e6) + np.int64(image_msg.header.stamp.nanosec / 1e3)
+        })
+        self.odometryStepIfReady()
+
+    def currentPose(self):
+        """Accumulated pose as a 4x4. Deliberately NOT dro.getPose(): that
+        re-runs motion_model.setTime() on a synthetic window and corrupts the
+        gyro integrals the next odometryStep relies on."""
+        xy = self.dro.current_pos.detach().cpu().numpy().ravel()
+        yaw = float(self.dro.current_rot.detach().cpu().numpy())
+        T = np.eye(4)
+        T[:2, :2] = [[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]]
+        T[0, 3], T[1, 3] = float(xy[0]), float(xy[1])
+        return T
+
     def imuCallback(self, msg):
         time = np.int64(msg.header.stamp.sec * 1e6) + np.int64(msg.header.stamp.nanosec / 1e3)
         if self.last_imu_time is not None and time <= self.last_imu_time:
@@ -233,7 +296,7 @@ class DroNode(Node):
 
 
         # Get the odometry results
-        current_odometry = self.dro.getPose(self.radar_data_buffer[0]['timestamp'])
+        current_odometry = self.currentPose()
         self.publishOdometry(current_odometry, self.radar_data_buffer[0]['timestamp'])
         self.logOdometry(current_odometry, self.radar_data_buffer[0]['timestamp'])
 
@@ -257,8 +320,8 @@ class DroNode(Node):
         odom_msg = Odometry()
         odom_msg.header.stamp.sec = int(timestamp // 1e6)
         odom_msg.header.stamp.nanosec = int((timestamp % 1e6) * 1e3)
-        odom_msg.header.frame_id = "odom"
-        odom_msg.child_frame_id = "radar"
+        odom_msg.header.frame_id = self.odom_frame_id
+        odom_msg.child_frame_id = self.child_frame_id
 
         # Set position
         odom_msg.pose.pose.position.x = pose[0, 3]
@@ -308,7 +371,7 @@ class DroNode(Node):
         local_map_image_msg = self.bridge.cv2_to_imgmsg(local_map, encoding="mono8")
         local_map_image_msg.header.stamp.sec = int(timestamp // 1e6)
         local_map_image_msg.header.stamp.nanosec = int((timestamp % 1e6) * 1e3)
-        local_map_image_msg.header.frame_id = "radar"
+        local_map_image_msg.header.frame_id = self.child_frame_id
         self.local_map_image_publisher.publish(local_map_image_msg)
 
         map_info_msg = LocalMapInfo()
@@ -322,8 +385,8 @@ class DroNode(Node):
         # Publish the local map odometry
         local_map_odom_msg = Odometry()
         local_map_odom_msg.header = local_map_image_msg.header
-        local_map_odom_msg.header.frame_id = "odom"
-        local_map_odom_msg.child_frame_id = "radar"
+        local_map_odom_msg.header.frame_id = self.odom_frame_id
+        local_map_odom_msg.child_frame_id = self.child_frame_id
         local_map_odom_msg.pose.pose.position.x = xy_theta[0]
         local_map_odom_msg.pose.pose.position.y = xy_theta[1]
         local_map_odom_msg.pose.pose.position.z = 0.0  # Assuming planar motion
