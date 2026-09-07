@@ -34,9 +34,13 @@ class DroNode(Node):
         self.declare_parameter('radar_frame_topic', '/radar_data/radar_frame')
         self.declare_parameter('metadata_columns', 11)
         self.declare_parameter('encoder_size', 16000)
-        # The RAS-3 turns clockwise. Ascending row order maps to a CCW frame in
-        # DRO, so bearings are taken as -tick/encoder_size*2pi to keep the output
-        # right-handed instead of mirrored.
+        # The RAS-3 turns clockwise while DRO maps ascending row order to a CCW
+        # frame, so the estimate comes out mirrored. Feeding descending bearings
+        # instead is NOT the fix: dro.py's angle->row mapping assumes ascending
+        # azimuths and the interpolation degrades (bedsheet_9: ATE 0.69 vs 0.18).
+        # What works, validated offline, is to keep ascending bearings, negate
+        # gyro z so the motion model matches the mirrored geometry, and reflect
+        # the OUTPUT pose (y -> -y, yaw -> -yaw) when publishing.
         self.declare_parameter('clockwise_radar', True)
         # Down-chirp radar: DRO negates the range-Doppler shift when the chirp
         # flag is non-zero (dro.py:844). Measured on the RAS-3, see
@@ -205,9 +209,7 @@ class DroNode(Node):
         ts = meta[:, :8].copy().view(np.uint64).ravel().astype(np.int64)
         tick = meta[:, 8:10].copy().view(np.uint16).ravel().astype(np.float64)
         o = np.argsort(ts)                              # row 0 holds the LAST spoke
-        az = tick[o] / self.encoder_size * 2.0 * np.pi
-        if self.clockwise_radar:
-            az = -az
+        az = tick[o] / self.encoder_size * 2.0 * np.pi   # ascending, see clockwise_radar
         self.radar_data_buffer.append({
             'polar': img[o, m:].astype(np.float32) / 255.0,
             'azimuths': az.astype(np.float32),
@@ -224,6 +226,8 @@ class DroNode(Node):
         gyro integrals the next odometryStep relies on."""
         xy = self.dro.current_pos.detach().cpu().numpy().ravel()
         yaw = float(self.dro.current_rot.detach().cpu().numpy())
+        if self.clockwise_radar:            # un-mirror: reflection across x
+            xy = np.array([xy[0], -xy[1]]); yaw = -yaw
         T = np.eye(4)
         T[:2, :2] = [[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]]
         T[0, 3], T[1, 3] = float(xy[0]), float(xy[1])
@@ -235,9 +239,10 @@ class DroNode(Node):
             self.get_logger().warn(f"Received out-of-order IMU message. Current time: {time}, Last time: {self.last_imu_time}")
             return
         self.last_imu_time = time
+        gz = -msg.angular_velocity.z if self.clockwise_radar else msg.angular_velocity.z
         imu_data = {
             'timestamp': time,
-            'angular_velocity': np.array([msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z]),
+            'angular_velocity': np.array([msg.angular_velocity.x, msg.angular_velocity.y, gz]),
             'linear_acceleration': np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
         }
         self.imu_data_buffer.append(imu_data)
