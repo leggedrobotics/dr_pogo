@@ -16,8 +16,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 # dro.py imports sklearn at module level (pairwise_distances); scikit-image is
 # only needed by raplace_node. pc7's pip defaults to a local devpi mirror that
 # does not carry scikit-learn, hence the explicit index.
+#
+# empy/lark/catkin_pkg: the base image carries the ROS runtime in /opt/venv but
+# not the interface-generation deps, and CMake resolves python to that venv
+# (/root/.local/bin/python3.12), so rosidl_adapter died with "No module named
+# em". Jazzy's rosidl needs empy 3.x -- 4.x removed the API it uses.
 RUN /opt/venv/bin/python3 -m pip install --no-cache-dir \
-        --index-url https://pypi.org/simple scikit-learn scikit-image
+        --index-url https://pypi.org/simple \
+        scikit-learn scikit-image "empy==3.3.4" lark catkin_pkg
 
 # Same RMW and tuned config as the robot side / CFEAR (bigger receive buffers
 # for whole-rotation radar frames).
