@@ -52,6 +52,86 @@ kDefaultDroOpts = {
 }
 
 
+def _fast_direct_iter(state, last_state, last_grad, prev_cost, step_q, done, first,
+                      vy_bias, chirp_sign, vel_to_bin_vec, R_integral, cos_r, sin_r,
+                      fd_c, fd_s, fd_r, fd_sign_s2r, fd_az, fd_I, fd_dshift_dir,
+                      local_map, inv_res, zero_idx, step_tol, cost_tol, degraded: bool):
+    """One gradient-ascent iteration of the direct cost for the ConstBodyVelGyro
+    model (state = body velocity, no Doppler cost), as a single branch-free
+    function so torch.compile fuses it into a handful of kernels.
+
+    Numerically the same as costFunctionAndJacobian + the loop body of solve():
+    Dro.solve evaluated the cost through six compiled sub-functions, materialised
+    the (N,2) Jacobian, and synchronised with the host ~5 times per iteration
+    (every `if` on a tensor). Per-scan constants (cos/sin of the azimuths
+    gathered per point, the even/odd range split, d_cart/d_shift) are taken from
+    prepareFastDirect instead of being rebuilt every iteration. The accept /
+    reject / halve logic runs on-device via torch.where and `done` freezes the
+    state, so the caller only has to read `done` every few iterations.
+    """
+    vx = state[0]; vy = state[1]
+    fast = vx > 3.0
+    vy_eff = torch.where(fast, vy + vy_bias, vy + vx * (vy_bias / 3.0))
+    dvy_dvx = torch.where(fast, torch.zeros_like(vx), torch.full_like(vx, vy_bias / 3.0))
+    shifts = chirp_sign * (vel_to_bin_vec[:, 0] * vx + vel_to_bin_vec[:, 1] * vy_eff)     # (A)
+    dsh0 = chirp_sign * (vel_to_bin_vec[:, 0] + vel_to_bin_vec[:, 1] * dvy_dvx)          # d shift / d vx
+    dsh1 = chirp_sign * vel_to_bin_vec[:, 1]                                            # d shift / d vy
+    pos = R_integral[:, :, 0] * vx + R_integral[:, :, 1] * vy                           # (A,2), raw state as in getVelPosRot
+
+    rng = fd_r + fd_sign_s2r * shifts[fd_az]
+    x = fd_c * rng; y = fd_s * rng
+    cr = cos_r[fd_az]; sr = sin_r[fd_az]
+    xr = x * cr - y * sr; yr = x * sr + y * cr
+    xt = xr + pos[fd_az, 0]; yt = yr + pos[fd_az, 1]
+    ix = -xt * inv_res + zero_idx; iy = yt * inv_res + zero_idx
+
+    H = local_map.shape[0]; W = local_map.shape[1]
+    ax0 = torch.floor(ix).int(); ax1 = ax0 + 1
+    r0 = torch.floor(iy).int(); r1 = r0 + 1
+    ax0 = torch.clamp(ax0, 0, H - 1); ax1 = torch.clamp(ax1, 0, H - 1)
+    r0 = torch.clamp(r0, 0, W - 1); r1 = torch.clamp(r1, 0, W - 1)
+    ixc = torch.clamp(ix, 0, H - 1); iyc = torch.clamp(iy, 0, W - 1)
+    Ia = local_map[ax0, r0]; Ib = local_map[ax1, r0]; Ic = local_map[ax0, r1]; Id = local_map[ax1, r1]
+    l1r = r1.float() - iyc; lr = iyc - r0.float()
+    l1a = ax1.float() - ixc; la = ixc - ax0.float()
+    interp = (l1a * l1r) * Ia + (la * l1r) * Ib + (l1a * lr) * Ic + (la * lr) * Id
+    dIdx = (Ib - Ia) * l1r + (Id - Ic) * lr
+    dIdy = (Ic - Ia) * l1a + (Id - Ib) * la
+    res = interp * fd_I
+
+    # d cart / d state per azimuth: R(rot) @ d_cart_d_shift (x) d_shift_d_state + R_integral,
+    # rows scaled to map indices (x -> -1/res, y -> +1/res)
+    dcs_x = fd_dshift_dir[:, 0] * cos_r - fd_dshift_dir[:, 1] * sin_r
+    dcs_y = fd_dshift_dir[:, 0] * sin_r + fd_dshift_dir[:, 1] * cos_r
+    A00 = (dcs_x * dsh0 + R_integral[:, 0, 0]) * (-inv_res)
+    A01 = (dcs_x * dsh1 + R_integral[:, 0, 1]) * (-inv_res)
+    A10 = (dcs_y * dsh0 + R_integral[:, 1, 0]) * inv_res
+    A11 = (dcs_y * dsh1 + R_integral[:, 1, 1]) * inv_res
+    J0 = (dIdx * A00[fd_az] + dIdy * A10[fd_az]) * fd_I
+    J1 = (dIdx * A01[fd_az] + dIdy * A11[fd_az]) * fd_I
+    if degraded:
+        w = (torch.clamp(torch.abs(interp - fd_I), 0, 1) - 1) ** 6
+        J0 = J0 * w; J1 = J1 * w
+    r2 = res * res
+    cost = torch.sum(r2 * res)
+    grad = 3.0 * torch.stack((torch.sum(r2 * J0), torch.sum(r2 * J1)))
+
+    # gradient-ascent bookkeeping (Dro.solve), branch-free
+    dec = (cost < prev_cost) & (~first) & (~done)
+    state = torch.where(dec, last_state, state)
+    grad = torch.where(dec, last_grad, grad)
+    step_q = torch.where(dec, step_q * 0.5, step_q)
+    last_state = state; last_grad = grad
+    gn = torch.linalg.norm(grad)
+    done_pre = done | (step_q < 1e-5) | (gn < 1e-9)
+    step = grad * (step_q / torch.clamp(gn, min=1e-30))
+    state = torch.where(done_pre, state, state + step)
+    sn = torch.linalg.norm(step)
+    stop_post = (sn < step_tol) | (torch.abs((cost - prev_cost) / cost) < cost_tol)
+    done = done_pre | stop_post
+    return state, last_state, last_grad, cost, step_q, done
+
+
 class Dro():
     def __init__(self, opts, node):
         torch.set_float32_matmul_precision('high')
@@ -65,6 +145,22 @@ class Dro():
             # Some hardcoded parameters
             self.kImgPadding = 200
             self.kOptFirstStep = 0.1
+            # Fused solver (see _fast_direct_iter). DRO_FAST=0 falls back to the
+            # original per-iteration path for A/B runs. kFastCheckEvery: how many
+            # iterations run between host reads of the `done` flag (each read is
+            # a GPU sync; iterations after convergence are frozen, so the result
+            # is identical for any value).
+            self.fast_direct = False
+            self.fast_enabled = os.environ.get("DRO_FAST", "1") != "0"
+            # Upstream's d_cart/d_shift alternates sign with the azimuth INDEX
+            # (up/down chirp interlacing) even when Doppler is off and every
+            # point uses the "even" range. DRO_FAST_CONSISTENT_JAC=1 makes the
+            # Jacobian match the residual in that case (experimental; default
+            # reproduces upstream).
+            self.fast_consistent_jac = os.environ.get("DRO_FAST_CONSISTENT_JAC", "0") == "1"
+            self.kFastCheckEvery = 4
+            self._fast_iter = _fast_direct_iter
+            self.fast_iters = 0
 
             self.max_diff_vel = opts['estimation']['max_acceleration'] * 0.25
 
@@ -164,6 +260,7 @@ class Dro():
         self.imgDopplerInterpAndJacobian = torch.compile(self.imgDopplerInterpAndJacobian, dynamic=True)
         self.cartToLocalMapIDSparse = torch.compile(self.cartToLocalMapIDSparse, dynamic=True)
         self.moveLocalMap = torch.compile(self.moveLocalMap, dynamic=True)
+        self._fast_iter = torch.compile(_fast_direct_iter, dynamic=True)
 
         # Warm up compiled callables so compile happens during initialization.
         nb_azimuths = opts['radar']['nb_azimuths']
@@ -314,6 +411,19 @@ class Dro():
         self.state_init = saved_state_init
         self.previous_vel = saved_previous_vel
         self.max_diff_vel = saved_max_diff_vel
+
+        # The fused solver only runs from the second scan on; compile both its
+        # variants here so the first real scans are not spent in inductor.
+        if self.fast_direct:
+            self.prepareFastDirect()
+            self.step_counter = 1
+            for dg in (False, True):
+                self.solveFast(torch.zeros_like(self.state_init), nb_iter=self.kFastCheckEvery,
+                               cost_tol=1e-6, step_tol=1e-5, degraded=dg)
+            self.step_counter = saved_step_counter
+            self.state_init = saved_state_init
+            self.previous_vel = saved_previous_vel
+            self.max_diff_vel = saved_max_diff_vel
 
                 
 
@@ -526,6 +636,8 @@ class Dro():
             self.direct_r_odd = self.direct_r_sparse[self.mask_direct_odd]
             self.direct_az_ids_even = self.direct_az_ids_sparse[self.mask_direct_even]
             self.direct_az_ids_odd = self.direct_az_ids_sparse[self.mask_direct_odd]
+            if self.fast_direct:
+                self.prepareFastDirect()
 
 
             ### Perform the optimisation
@@ -607,6 +719,7 @@ class Dro():
             self.range_vec = torch.arange(self.max_range_idx_direct).to(self.device).float() * res + (res/2.0)
 
             self.use_doppler = self.isDopplerEnabled(radar_data)
+            self.fast_direct = self.fast_enabled and self.use_gyro and (not self.use_doppler)
 
             range_start = int(np.ceil(float(self.opts['doppler']['min_range']) / res))
             range_end = int(np.floor(float(self.opts['doppler']['max_range']) / res))
@@ -1035,6 +1148,8 @@ class Dro():
             # (no registration possible yet)
             if self.step_counter == 0 and not self.use_doppler:
                 return state_init
+            if self.fast_direct and not doppler_only:
+                return self.solveFast(state_init, nb_iter, cost_tol, step_tol, degraded)
 
             # The gradient ascent keep track of the last increasing state and gradient
             # Thus, if the cost function decreases, we go back to the last increasing
@@ -1115,6 +1230,64 @@ class Dro():
                 self.max_diff_vel = self.motion_model.time[-1] * self.max_acc
             
             
+            return state
+
+    def prepareFastDirect(self):
+        """Per-scan constants of the direct cost for _fast_direct_iter (gathered
+        once per scan instead of once per iteration)."""
+        with torch.no_grad():
+            az = self.direct_az_ids_sparse
+            c_az = torch.cos(self.azimuths); s_az = torch.sin(self.azimuths)
+            self.fd_c = c_az[az]; self.fd_s = s_az[az]
+            self.fd_r = self.direct_r_sparse
+            self.fd_sign_s2r = torch.where(self.mask_direct_even, -self.shift_to_range, self.shift_to_range).float()
+            self.fd_az = az
+            self.fd_I = self.polar_intensity_sparse
+            sign_az = torch.ones(self.azimuths.shape[0], device=self.device)
+            if self.fast_consistent_jac and not self.use_doppler:
+                sign_az[:] = -1.0                       # every point uses the "even" range
+            else:
+                sign_az[::2] = -1.0                     # upstream: parity of the azimuth index
+            self.fd_dshift_dir = torch.stack((sign_az * c_az, sign_az * s_az), dim=1) * self.shift_to_range
+            self.fd_inv_res = (1.0 / self.local_map_res).float()
+            self.fd_zero_idx = self.local_map_zero_idx.float()
+
+    def solveFast(self, state_init, nb_iter=20, cost_tol=1e-6, step_tol=1e-6, degraded=False):
+        """solve() for the fused direct-cost path; same algorithm and stopping
+        rules, but one compiled call per iteration and one host sync per
+        kFastCheckEvery iterations."""
+        with torch.no_grad():
+            dev = self.device
+            mm = self.motion_model
+            state = state_init.clone()
+            last_state = state.clone()
+            last_grad = torch.zeros_like(state)
+            prev_cost = torch.tensor(float('inf'), device=dev)
+            step_q = torch.tensor(self.kOptFirstStep, device=dev)
+            done = torch.tensor(False, device=dev)
+            first = torch.tensor(True, device=dev)
+            not_first = torch.tensor(False, device=dev)
+            chirp_sign = torch.tensor(1.0 if self.chirp_up else -1.0, device=dev)
+            args = (float(self.vy_bias), chirp_sign, self.vel_to_bin_vec, mm.R_integral, mm.cos_r, mm.sin_r,
+                    self.fd_c, self.fd_s, self.fd_r, self.fd_sign_s2r, self.fd_az, self.fd_I, self.fd_dshift_dir,
+                    self.local_map_blurred, self.fd_inv_res, self.fd_zero_idx,
+                    float(step_tol), float(cost_tol), bool(degraded))
+            K = self.kFastCheckEvery
+            for i in range(nb_iter):
+                state, last_state, last_grad, prev_cost, step_q, done = self._fast_iter(
+                    state, last_state, last_grad, prev_cost, step_q, done,
+                    first if i == 0 else not_first, *args)
+                self.fast_iters += 1
+                if (i + 1) % K == 0 and bool(done):
+                    break
+
+            # Same post-checks as solve() (ConstBodyVelGyro: vel == state)
+            try_degraded = torch.abs(torch.norm(state) - self.previous_vel) > self.max_diff_vel
+            if try_degraded and not degraded:
+                state = self.solveFast(state_init, nb_iter=nb_iter, cost_tol=cost_tol, step_tol=step_tol, degraded=True)
+            if not degraded:
+                self.previous_vel = torch.norm(state)
+                self.max_diff_vel = mm.time[-1] * self.max_acc
             return state
 
     # Helper function to get the local map indices from the cartesian coordinates

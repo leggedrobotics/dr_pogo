@@ -39,6 +39,7 @@ radar:
   # diverges on hg_4, hg_nav_5 and bedsheet_7. Equivalent offline setting:
   # beta_corr_fact -3.0 with chirps 0.
   beta_corr_fact: 3.0
+  # beta_corr_fact: 1.0
 
 gp:
   lengthscale_az: 2.0
@@ -48,7 +49,11 @@ gp:
 direct:
   min_range: 4.0
   max_range: 65.0
-  max_local_map_range: 120.0
+  # 70 m, not upstream's 120 m: the direct cost only ever reads the map within
+  # direct.max_range (65 m), so the outer 50 m were pure cost (map cells 5.76M
+  # -> 1.96M). Profiled 2026-09-08 on the Thor: step 258 -> 181 ms, identical
+  # trajectories on hg_nav_5 and hg_4 (thesis dro_vs_cfear/pc7_bench/prof).
+  max_local_map_range: 70.0
   local_map_res: 0.10      # the only real speed lever (0.20 misses the 250 ms
                            # budget 1.2% of the time on an idle Thor)
   local_map_update_alpha: 0.1
