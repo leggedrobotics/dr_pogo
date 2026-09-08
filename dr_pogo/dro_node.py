@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import rclpy
+from rclpy.time import Time
 from rclpy.node import Node
 from sensor_msgs.msg import Imu
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import TransformStamped
+import tf2_ros
 from message_filters import Subscriber, TimeSynchronizer
 from dr_pogo.msg import RadarInfo, LocalMapInfo
 import numpy as np
@@ -48,6 +51,18 @@ class DroNode(Node):
         self.declare_parameter('chirp_down', True)
         self.declare_parameter('odom_frame_id', 'dro_odom')
         self.declare_parameter('child_frame_id', 'radar_link')
+        # TF: broadcast odom_frame_id -> tf_body_frame (same scheme as CFEAR's
+        # frames.tf_body_frame). Not odom -> radar_link: the radar driver
+        # already parents radar_link under the lidar, and a frame with two
+        # parents makes every tf2 lookup depend on arrival order. The body pose
+        # is the radar pose composed with the static radar_link <- body
+        # extrinsic from tf2, looked up once. Empty tf_body_frame broadcasts
+        # odom -> child_frame_id directly (standalone / Boreas use).
+        # Only ONE radar odometry may publish a parent for base at a time:
+        # running CFEAR (publish_tf) and DRO with publish_tf together gives
+        # base two parents.
+        self.declare_parameter('publish_tf', True)
+        self.declare_parameter('tf_body_frame', 'base')
         self.declare_parameter('config_file', '')
         gp = lambda k: self.get_parameter(k).value
         self.input_mode = gp('input_mode')
@@ -57,6 +72,13 @@ class DroNode(Node):
         self.chirp_down = bool(gp('chirp_down'))
         self.odom_frame_id = gp('odom_frame_id')
         self.child_frame_id = gp('child_frame_id')
+        self.publish_tf = bool(gp('publish_tf'))
+        self.tf_body_frame = gp('tf_body_frame') or self.child_frame_id
+        self.T_radar_body = None                    # child_frame_id <- tf_body_frame, cached
+        if self.publish_tf:
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+            self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         self.imu_subscription = self.create_subscription(Imu, gp('imu_topic'), self.imuCallback, 1000)
 
@@ -340,6 +362,48 @@ class DroNode(Node):
         odom_msg.pose.pose.orientation.z = quaternion[2]
         odom_msg.pose.pose.orientation.w = quaternion[3]
         self.odometry_publisher.publish(odom_msg)
+        if self.publish_tf:
+            self.publishBodyTf(pose, odom_msg.header.stamp)
+
+    def publishBodyTf(self, pose, stamp):
+        """odom_frame_id -> tf_body_frame for the pose just published.
+        pose is odom <- child_frame_id (the radar), so the body is
+        pose @ (child_frame_id <- tf_body_frame), the static mount extrinsic.
+        Until /tf_static delivers it nothing is broadcast: a wrong tree is
+        worse than a late one. The body inherits the radar's height (DRO is
+        planar AT THE SENSOR), exactly like CFEAR."""
+        if self.T_radar_body is None:
+            if self.tf_body_frame == self.child_frame_id:
+                self.T_radar_body = np.eye(4)
+            else:
+                try:
+                    tf = self.tf_buffer.lookup_transform(self.child_frame_id, self.tf_body_frame,
+                                                         Time())
+                except tf2_ros.TransformException as ex:
+                    self.get_logger().warn(
+                        f"No {self.child_frame_id} <- {self.tf_body_frame} yet, not broadcasting "
+                        f"{self.odom_frame_id} -> {self.tf_body_frame}: {ex}",
+                        throttle_duration_sec=5.0)
+                    return
+                q = tf.transform.rotation; t = tf.transform.translation
+                T = np.eye(4)
+                T[:3, :3] = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+                T[:3, 3] = [t.x, t.y, t.z]
+                self.T_radar_body = T
+                self.get_logger().info(
+                    f"Resolved {self.child_frame_id} <- {self.tf_body_frame}: "
+                    f"({t.x:.3f}, {t.y:.3f}, {t.z:.3f}) m")
+        T = pose @ self.T_radar_body
+        q = R.from_matrix(T[:3, :3]).as_quat()
+        msg = TransformStamped()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.odom_frame_id
+        msg.child_frame_id = self.tf_body_frame
+        msg.transform.translation.x, msg.transform.translation.y, msg.transform.translation.z = \
+            float(T[0, 3]), float(T[1, 3]), float(T[2, 3])
+        msg.transform.rotation.x, msg.transform.rotation.y, msg.transform.rotation.z, msg.transform.rotation.w = \
+            float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        self.tf_broadcaster.sendTransform(msg)
 
 
     def logOdometry(self, pose, timestamp):
