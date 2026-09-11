@@ -40,6 +40,20 @@ RUN . /opt/ros/jazzy/setup.sh && \
 RUN echo 'source /opt/ros/jazzy/setup.bash' >> /root/.bashrc && \
     echo 'source /ws/install/setup.bash' >> /root/.bashrc
 
+# Rosbag recording from inside this container. b2w_rsl's `rservice-record`
+# (utils/deploy_utils/functions.sh) does
+#   docker compose exec dro tmux new-session ... record-bag <bag> <topics...>
+# so both have to exist HERE. jetfast:thor-dev already carries tmux; record-bag
+# comes from the b2w utils image, exactly as docker/navtech_radar/Dockerfile in
+# b2w_rsl does it (that image is a few tens of kB of plain files, so it is
+# architecture-agnostic and works on the Thor). `docker compose exec` skips the
+# ENTRYPOINT, so ros2 reaches the recorder only through the shell tmux starts:
+# a LOGIN shell, whose /root/.profile sources the /root/.bashrc lines above.
+# Verified in this image (ros2 -> /opt/ros/jazzy/bin/ros2 in a tmux pane).
+# Bags land in /bags -- bind-mounted to ~/bags by the compose service.
+COPY --from=rslethz/b2w:deploy_utils /record-bag.sh /usr/local/bin/record-bag
+RUN chmod +x /usr/local/bin/record-bag
+
 # Chain through the base image's entrypoint rather than replacing it: it
 # prepends /usr/lib/aarch64-linux-gnu to LD_LIBRARY_PATH so torch loads the
 # system cuDNN (9.21.1, matching CUDA 13.0) instead of the pip
