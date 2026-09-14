@@ -255,6 +255,31 @@ class DroNode(Node):
         T[0, 3], T[1, 3] = float(xy[0]), float(xy[1])
         return T
 
+    def currentTwist(self, imus):
+        """Body-frame (child_frame_id = radar) twist for the scan just solved.
+
+        DRO's state IS the planar body velocity of the sensor over the scan
+        (ConstBodyVelGyro: [vx, vy]; ConstVelConstW: [vx, vy, w]), so the linear
+        part comes straight from the solved state rather than from differencing
+        poses. The yaw rate is the mean gyro z over the IMU window that covered
+        the scan (ConstVelConstW's own w is used only when there is no gyro).
+        Both are un-mirrored like currentPose() when the radar spins clockwise.
+        Planar at the sensor: vz, wx, wy are zero, and the lever arm to the body
+        is NOT applied here (nav_msgs/Odometry semantics: twist in child_frame_id).
+        """
+        s = self.dro.state_init.detach().cpu().numpy().ravel()
+        vx, vy = float(s[0]), float(s[1])
+        gz_samples = [imu['angular_velocity'][2] for imu in imus] if imus else []
+        if gz_samples:
+            wz = float(np.mean(gz_samples))
+        elif s.size >= 3:
+            wz = float(s[2])
+        else:
+            wz = 0.0
+        if self.clockwise_radar:            # un-mirror: reflection across x
+            vy, wz = -vy, -wz
+        return vx, vy, wz
+
     def imuCallback(self, msg):
         time = np.int64(msg.header.stamp.sec * 1e6) + np.int64(msg.header.stamp.nanosec / 1e3)
         if self.last_imu_time is not None and time <= self.last_imu_time:
@@ -324,7 +349,8 @@ class DroNode(Node):
 
         # Get the odometry results
         current_odometry = self.currentPose()
-        self.publishOdometry(current_odometry, self.radar_data_buffer[0]['timestamp'])
+        self.publishOdometry(current_odometry, self.radar_data_buffer[0]['timestamp'],
+                             self.currentTwist(relevant_imus))
         self.logOdometry(current_odometry, self.radar_data_buffer[0]['timestamp'])
 
 
@@ -343,8 +369,13 @@ class DroNode(Node):
 
 
 
-    def publishOdometry(self, pose, timestamp):
+    def publishOdometry(self, pose, timestamp, twist=None):
         odom_msg = Odometry()
+        if twist is not None:
+            vx, vy, wz = twist
+            odom_msg.twist.twist.linear.x = vx
+            odom_msg.twist.twist.linear.y = vy
+            odom_msg.twist.twist.angular.z = wz
         odom_msg.header.stamp.sec = int(timestamp // 1e6)
         odom_msg.header.stamp.nanosec = int((timestamp % 1e6) * 1e3)
         odom_msg.header.frame_id = self.odom_frame_id
