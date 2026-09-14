@@ -47,7 +47,16 @@ gp:
   sz: 0.6
 
 direct:
-  min_range: 4.0
+  # 1.5 m, not upstream's 4.0 m. In a 5x9 m room (fog_test 2026-09-09) the
+  # strongest return per azimuth sits at a median 1.8 m, so 4 m masked the
+  # walls, left multipath, and hand-pushed turns ran the body velocity away to
+  # 12-16 m/s that never recovered (the solver returns its warm start once the
+  # scan no longer overlaps the map). 1.5 m removes the runaway on all three
+  # fog bags; on the 9 DLIO-referenced bags ATE moves by -0.10..+0.04 m
+  # (hg_4 better, bedsheet 2-4 cm worse, hg_nav flat) and the Thor step time
+  # is unchanged (launch-bound, not point-bound). 1.0 m gives the same numbers.
+  # Analysis: thesis data_analysis/odometry/dro_vs_cfear/figures/minrange_sweep.md
+  min_range: 1.5
   max_range: 65.0
   # 70 m, not upstream's 120 m: the direct cost only ever reads the map within
   # direct.max_range (65 m), so the outer 50 m were pure cost (map cells 5.76M
