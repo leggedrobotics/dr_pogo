@@ -4,26 +4,46 @@
 # Build from the repository root (the compose `dro` service does this):
 #   docker build -f docker/Dockerfile.jetson -t rslethz/fognav:dro .
 #
-# Base: jetfast:thor-dev is built locally on pc7 (no registry) and already
-# carries ROS 2 Jazzy, PyTorch 2.12+cu130 for sm_110, torchvision, OpenCV,
-# cv_bridge, message_filters, Ceres, yaml-cpp and CycloneDDS -- all inside the
-# same /opt/venv python, which is what makes `import torch` and `import rclpy`
-# coexist. Do not swap it for an l4t-pytorch image without re-checking that.
-FROM jetfast:thor-dev
+# Base: rslethz/fognav:radarsplat-jetson (FogNav-radar-splatting
+# docker/radarsplat/Dockerfile.jetson) -- build that one first. Its
+# `radarsplat` conda env carries ROS 2 Jazzy (RoboStack), torch cu130 for
+# sm_110 with a triton that compiles on the Thor, torchvision, OpenCV,
+# cv_bridge, message_filters, scikit-learn and CycloneDDS in ONE interpreter,
+# which is what lets `import torch` and `import rclpy` coexist. Up to
+# 2026-09-14 this image was built FROM jetfast:thor-dev, a hand-built image
+# that existed only on pc7 and was lost with no recipe; do not reintroduce a
+# base that lives on one machine.
+FROM rslethz/fognav:radarsplat-jetson
 
 ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-c"]
 
-# dro.py imports sklearn at module level (pairwise_distances); scikit-image is
-# only needed by raplace_node. pc7's pip defaults to a local devpi mirror that
-# does not carry scikit-learn, hence the explicit index.
-#
-# empy/lark/catkin_pkg: the base image carries the ROS runtime in /opt/venv but
-# not the interface-generation deps, and CMake resolves python to that venv
-# (/root/.local/bin/python3.12), so rosidl_adapter died with "No module named
-# em". Jazzy's rosidl needs empy 3.x -- 4.x removed the API it uses.
-RUN /opt/venv/bin/python3 -m pip install --no-cache-dir \
-        --index-url https://pypi.org/simple \
-        scikit-learn scikit-image "empy==3.3.4" lark catkin_pkg
+# pogo_node (C++, not used by the DRO python node but part of the package)
+# needs Ceres, yaml-cpp and Eigen. From apt: the base image's conda has a
+# broken libmamba solver (`conda install` aborts with "non-default solver
+# backend (libmamba) ... not recognized"), and the RoboStack CMake finds the
+# system packages through the default /usr prefix.
+# liblttng-ust-dev: RoboStack's rclcpp links -llttng-ust, which the conda env
+# does not ship (and its conda cannot install anything, see above).
+# Ceres from apt requires the exact Eigen it was built against, so apt's
+# Eigen must be the ONLY one the compiler sees: the conda env's Eigen headers
+# (a different 3.4.x) are removed from THIS image. Nothing in the env needs
+# them at runtime (its ROS packages are python), and with both present the
+# NEON kernels get defined twice ("redefinition of struct
+# Eigen::internal::gebp_traits") and pogo_node does not compile.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libceres-dev libyaml-cpp-dev libeigen3-dev liblttng-ust-dev \
+    && rm -rf /var/lib/apt/lists/* \
+       /opt/conda/envs/radarsplat/include/eigen3 \
+       /opt/conda/envs/radarsplat/share/eigen3 \
+       /opt/conda/envs/radarsplat/share/cmake/eigen3 \
+       /opt/conda/envs/radarsplat/lib/pkgconfig/eigen3.pc
+
+# dro_node imports pandas (trajectory log). sklearn/scikit-image/empy/lark/
+# catkin_pkg are already in the env. pc7's pip defaults to a local devpi
+# mirror that does not carry everything, hence the explicit index.
+RUN source /opt/conda/etc/profile.d/conda.sh && conda activate radarsplat && \
+    pip install --no-cache-dir --index-url https://pypi.org/simple pandas
 
 # Same RMW and tuned config as the robot side / CFEAR (bigger receive buffers
 # for whole-rotation radar frames).
@@ -33,33 +53,33 @@ ENV CYCLONEDDS_URI=file:///ws/config/cyclonedds.xml
 
 WORKDIR /ws
 COPY . src/dr_pogo
-RUN . /opt/ros/jazzy/setup.sh && \
+RUN source /opt/conda/etc/profile.d/conda.sh && conda activate radarsplat && \
     colcon build --merge-install --packages-select dr_pogo \
         --cmake-args -DCMAKE_BUILD_TYPE=Release
 
-RUN echo 'source /opt/ros/jazzy/setup.bash' >> /root/.bashrc && \
-    echo 'source /ws/install/setup.bash' >> /root/.bashrc
+# The base image's /root/.bashrc already activates the conda env (and so ROS);
+# add the overlay so a `docker compose exec ... tmux` login shell sees dr_pogo.
+RUN echo 'source /ws/install/setup.bash' >> /root/.bashrc
 
 # Rosbag recording from inside this container. b2w_rsl's `rservice-record`
 # (utils/deploy_utils/functions.sh) does
 #   docker compose exec dro tmux new-session ... record-bag <bag> <topics...>
-# so both have to exist HERE. jetfast:thor-dev already carries tmux; record-bag
-# comes from the b2w utils image, exactly as docker/navtech_radar/Dockerfile in
-# b2w_rsl does it (that image is a few tens of kB of plain files, so it is
-# architecture-agnostic and works on the Thor). `docker compose exec` skips the
-# ENTRYPOINT, so ros2 reaches the recorder only through the shell tmux starts:
-# a LOGIN shell, whose /root/.profile sources the /root/.bashrc lines above.
-# Verified in this image (ros2 -> /opt/ros/jazzy/bin/ros2 in a tmux pane).
-# Bags land in /bags -- bind-mounted to ~/bags by the compose service.
+# so both have to exist HERE. record-bag comes from the b2w utils image,
+# exactly as docker/navtech_radar/Dockerfile in b2w_rsl does it (that image is
+# a few tens of kB of plain files, so it is architecture-agnostic and works on
+# the Thor). `docker compose exec` skips the ENTRYPOINT, so ros2 reaches the
+# recorder only through the shell tmux starts: a LOGIN shell, whose
+# /root/.profile sources the /root/.bashrc lines above. Bags land in /bags --
+# bind-mounted to ~/bags by the compose service.
+RUN apt-get update && apt-get install -y --no-install-recommends tmux \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=rslethz/b2w:deploy_utils /record-bag.sh /usr/local/bin/record-bag
 RUN chmod +x /usr/local/bin/record-bag
 
-# Chain through the base image's entrypoint rather than replacing it: it
-# prepends /usr/lib/aarch64-linux-gnu to LD_LIBRARY_PATH so torch loads the
-# system cuDNN (9.21.1, matching CUDA 13.0) instead of the pip
-# nvidia-cudnn-cu13 wheel (9.20.0) also present in the venv. With a plain
-# ROS-only entrypoint the pip copy loads first and the very first conv2d dies
-# with CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH.
+# Chain through the base image's (NVIDIA CUDA) entrypoint rather than
+# replacing it; ours activates the conda env + the dr_pogo overlay and execs
+# the compose command.
 COPY docker/ros_entrypoint.sh /ros_entrypoint_dro.sh
-ENTRYPOINT ["/docker-entrypoint.sh", "/ros_entrypoint_dro.sh"]
+RUN chmod +x /ros_entrypoint_dro.sh
+ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh", "/ros_entrypoint_dro.sh"]
 CMD ["bash"]
